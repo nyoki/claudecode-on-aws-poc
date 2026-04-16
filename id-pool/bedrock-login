@@ -1,0 +1,280 @@
+#!/bin/bash
+# Claude Code の awsCredentialExport 用ヘルパースクリプト
+# ブラウザで Cognito 認証 → Identity Pool → AWS 一時クレデンシャルを JSON で出力する
+#
+# セキュリティ:
+#   - リフレッシュトークン: macOS Keychain に保存（平文ファイルに書かない）
+#   - AWS クレデンシャル: stdout に出力するのみ（ファイルに書かない）
+#
+# Usage:
+#   bedrock-login            # 認証してクレデンシャルを取得（ターミナルではキー非表示）
+#   bedrock-login --verbose  # クレデンシャル JSON も表示
+#   bedrock-login --clear    # Keychain のトークンをクリア
+set -euo pipefail
+export AWS_PAGER=""
+
+# --- AWS 環境変数をクリア（親プロセスの設定が混入しないようにする）---
+unset AWS_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+unset AWS_CONFIG_FILE AWS_SHARED_CREDENTIALS_FILE
+
+# --- 設定読み込み ---
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$SCRIPT_DIR/env.sh" ]; then
+  source "$SCRIPT_DIR/env.sh"
+fi
+
+REGION="${AWS_REGION:-ap-northeast-1}"
+USER_POOL_ID="${COGNITO_USER_POOL_ID:?env.sh が見つからないか COGNITO_USER_POOL_ID が未設定です}"
+CLIENT_ID="${COGNITO_CLIENT_ID:?COGNITO_CLIENT_ID が未設定です}"
+IDENTITY_POOL_ID="${COGNITO_IDENTITY_POOL_ID:?COGNITO_IDENTITY_POOL_ID が未設定です}"
+PROVIDER_NAME="${COGNITO_PROVIDER_NAME:-cognito-idp.${REGION}.amazonaws.com/${USER_POOL_ID}}"
+COGNITO_DOMAIN="${COGNITO_DOMAIN:?COGNITO_DOMAIN が未設定です}"
+CALLBACK_PORTS_STR="${CALLBACK_PORTS:-19240 19336 19427 19777 19819}"
+read -ra CALLBACK_PORTS <<< "$CALLBACK_PORTS_STR"
+
+# --- オプション解析 ---
+VERBOSE=false
+for arg in "$@"; do
+  case "$arg" in
+    --verbose) VERBOSE=true ;;
+  esac
+done
+
+# --- Keychain 設定 ---
+KEYCHAIN_SERVICE="com.claudecode.bedrock-login"
+KEYCHAIN_ACCOUNT_REFRESH="cognito-refresh-token"
+KEYCHAIN_ACCOUNT_LOGOUT="cognito-logout-flag"
+
+# --- ユーティリティ ---
+log() { echo "$*" >&2; }
+
+keychain_get() {
+  security find-generic-password -a "$1" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || echo ""
+}
+
+keychain_set() {
+  security add-generic-password -a "$1" -s "$KEYCHAIN_SERVICE" -w "$2" -U 2>/dev/null || \
+  security add-generic-password -a "$1" -s "$KEYCHAIN_SERVICE" -w "$2" 2>/dev/null
+}
+
+keychain_delete() {
+  security delete-generic-password -a "$1" -s "$KEYCHAIN_SERVICE" 2>/dev/null || true
+}
+
+# --- キャッシュクリア ---
+if [ "${1:-}" = "--clear" ]; then
+  keychain_delete "$KEYCHAIN_ACCOUNT_REFRESH"
+  keychain_delete "$KEYCHAIN_ACCOUNT_LOGOUT"
+  log "Keychain のトークンをクリアしました。"
+  exit 0
+fi
+
+# --- ログアウト状態チェック ---
+LOGOUT_FLAG=$(keychain_get "$KEYCHAIN_ACCOUNT_LOGOUT")
+if [ "$LOGOUT_FLAG" = "true" ]; then
+  if [ -t 1 ]; then
+    # ターミナルから手動実行 → フラグを解除して認証に進む
+    keychain_delete "$KEYCHAIN_ACCOUNT_LOGOUT"
+    log "ログアウト状態を解除します。"
+  else
+    # Claude Code からの呼び出し → エラーで終了
+    log "ログアウト状態です。bedrock-login を手動で実行して再認証してください。"
+    exit 1
+  fi
+fi
+
+# --- トークン取得関数 ---
+
+# リフレッシュトークンで ID Token を更新
+get_tokens_by_refresh() {
+  local refresh_token="$1"
+  aws cognito-idp initiate-auth \
+    --region "$REGION" \
+    --no-cli-pager \
+    --client-id "$CLIENT_ID" \
+    --auth-flow REFRESH_TOKEN_AUTH \
+    --auth-parameters "REFRESH_TOKEN=$refresh_token" \
+    --output json 2>/dev/null
+}
+
+# PKCE の code_verifier と code_challenge を生成
+generate_pkce() {
+  python3 -c "
+import secrets, hashlib, base64
+verifier = secrets.token_urlsafe(32)
+challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
+print(verifier)
+print(challenge)
+"
+}
+
+# ブラウザ認証で認可コードを取得 → トークンに交換（PKCE 付き）
+get_tokens_by_browser() {
+  # 空いているポートを探す
+  local selected_port=""
+  for port in "${CALLBACK_PORTS[@]}"; do
+    if ! lsof -i ":$port" >/dev/null 2>&1; then
+      selected_port="$port"
+      break
+    fi
+  done
+
+  if [ -z "$selected_port" ]; then
+    log "  -> エラー: 全てのコールバックポート (${CALLBACK_PORTS[*]}) が使用中です"
+    exit 1
+  fi
+
+  # PKCE パラメータ生成
+  local pkce
+  pkce=$(generate_pkce)
+  local code_verifier code_challenge
+  code_verifier=$(echo "$pkce" | sed -n '1p')
+  code_challenge=$(echo "$pkce" | sed -n '2p')
+
+  local callback_url="http://localhost:${selected_port}/callback"
+  local auth_url="${COGNITO_DOMAIN}/oauth2/authorize?response_type=code&client_id=${CLIENT_ID}&redirect_uri=${callback_url}&scope=openid+email+profile&code_challenge=${code_challenge}&code_challenge_method=S256&prompt=login"
+
+  log ""
+  log "🔐 Bedrock ログイン (ブラウザ認証)"
+  log ""
+  log "URL: $auth_url"
+  log ""
+  log "ブラウザを開いています..."
+
+  # ブラウザを開く
+  open "$auth_url" 2>/dev/null || xdg-open "$auth_url" 2>/dev/null || {
+    log "ブラウザを手動で開いてください"
+  }
+
+  # ローカル HTTP サーバで認可コードを受け取る
+  log "ログイン待機中 (localhost:${selected_port})..."
+
+  local auth_code
+  auth_code=$(python3 -c "
+import http.server
+import urllib.parse
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    auth_code = None
+    def do_GET(self):
+        query = urllib.parse.urlparse(self.path).query
+        params = urllib.parse.parse_qs(query)
+        if 'code' in params:
+            Handler.auth_code = params['code'][0]
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write('✅ 認証成功！このタブを閉じてください。'.encode('utf-8'))
+        elif 'error' in params:
+            self.send_response(400)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            error_msg = params.get('error_description', params['error'])[0]
+            self.wfile.write(f'❌ 認証エラー: {error_msg}'.encode('utf-8'))
+        else:
+            self.send_response(400)
+            self.end_headers()
+    def log_message(self, format, *args):
+        pass  # サーバログを抑制
+
+server = http.server.HTTPServer(('127.0.0.1', ${selected_port}), Handler)
+server.timeout = 120  # 2分でタイムアウト
+server.handle_request()
+if Handler.auth_code:
+    print(Handler.auth_code)
+else:
+    exit(1)
+")
+
+  if [ -z "$auth_code" ]; then
+    log "  -> 認証がタイムアウトまたは失敗しました"
+    exit 1
+  fi
+
+  log "  -> 認可コード取得成功"
+
+  # 認可コードをトークンに交換（PKCE: code_verifier を送信、Client Secret 不要）
+  local token_response
+  token_response=$(curl -s -X POST "${COGNITO_DOMAIN}/oauth2/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=authorization_code&code=${auth_code}&redirect_uri=${callback_url}&client_id=${CLIENT_ID}&code_verifier=${code_verifier}")
+
+  echo "$token_response"
+}
+
+ID_TOKEN=""
+
+# --- リフレッシュトークンでの更新を試行（Keychain から取得）---
+REFRESH_TOKEN=$(keychain_get "$KEYCHAIN_ACCOUNT_REFRESH")
+if [ -n "$REFRESH_TOKEN" ]; then
+  log "リフレッシュトークンで更新中..."
+  REFRESH_RESULT=$(get_tokens_by_refresh "$REFRESH_TOKEN" || echo "")
+  if [ -n "$REFRESH_RESULT" ]; then
+    ID_TOKEN=$(echo "$REFRESH_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['AuthenticationResult']['IdToken'])" 2>/dev/null || echo "")
+    if [ -n "$ID_TOKEN" ]; then
+      log "  -> リフレッシュ成功"
+    else
+      log "  -> リフレッシュ失敗、ブラウザ認証に切り替えます"
+      ID_TOKEN=""
+    fi
+  else
+    log "  -> リフレッシュ失敗、ブラウザ認証に切り替えます"
+  fi
+fi
+
+# --- リフレッシュできなかった場合はブラウザ認証 ---
+if [ -z "$ID_TOKEN" ]; then
+  TOKEN_RESPONSE=$(get_tokens_by_browser)
+
+  ID_TOKEN=$(echo "$TOKEN_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id_token'])")
+  NEW_REFRESH_TOKEN=$(echo "$TOKEN_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('refresh_token',''))")
+
+  # リフレッシュトークンを Keychain に保存
+  if [ -n "$NEW_REFRESH_TOKEN" ]; then
+    keychain_set "$KEYCHAIN_ACCOUNT_REFRESH" "$NEW_REFRESH_TOKEN"
+  fi
+
+  log "  -> 認証成功"
+fi
+
+# --- Identity Pool から AWS クレデンシャルを取得 ---
+IDENTITY_ID=$(aws cognito-identity get-id \
+  --region "$REGION" \
+  --no-cli-pager \
+  --identity-pool-id "$IDENTITY_POOL_ID" \
+  --logins "$PROVIDER_NAME=$ID_TOKEN" \
+  --output text --query "IdentityId")
+
+CREDS_JSON=$(aws cognito-identity get-credentials-for-identity \
+  --region "$REGION" \
+  --no-cli-pager \
+  --identity-id "$IDENTITY_ID" \
+  --logins "$PROVIDER_NAME=$ID_TOKEN" \
+  --output json)
+
+# Claude Code が期待する形式に変換（ファイルには書かない）
+CRED_OUTPUT=$(python3 -c "
+import json, sys
+creds = json.loads(sys.stdin.read())['Credentials']
+result = {
+    'Credentials': {
+        'AccessKeyId': creds['AccessKeyId'],
+        'SecretAccessKey': creds['SecretKey'],
+        'SessionToken': creds['SessionToken'],
+    }
+}
+json.dump(result, sys.stdout)
+" <<< "$CREDS_JSON")
+
+# stdout がターミナルかパイプかで出力を切り替え
+if [ -t 1 ]; then
+  if [ "$VERBOSE" = true ]; then
+    echo "$CRED_OUTPUT"
+  else
+    KEY_PREFIX=$(echo "$CRED_OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['Credentials']['AccessKeyId'][:12])")
+    log "  -> クレデンシャル取得成功 (${KEY_PREFIX}...)"
+    log "  -> 詳細を表示するには --verbose を付けてください"
+  fi
+else
+  echo "$CRED_OUTPUT"
+fi

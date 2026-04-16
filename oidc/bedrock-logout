@@ -1,0 +1,86 @@
+#!/bin/bash
+# Keychain のトークンをクリアし、ブラウザの Cognito セッションもログアウトする
+# Usage:
+#   bedrock-logout          # Keychain クリア + ブラウザセッションをクリア
+#   bedrock-logout --local  # Keychain クリアのみ（ブラウザのセッションは維持）
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$SCRIPT_DIR/env.sh" ]; then
+  source "$SCRIPT_DIR/env.sh"
+fi
+
+CALLBACK_PORTS_STR="${CALLBACK_PORTS:-19240 19336 19427 19777 19819}"
+read -ra CALLBACK_PORTS <<< "$CALLBACK_PORTS_STR"
+
+# --- Keychain 設定（Identity Pool 版と衝突しないサービス名）---
+KEYCHAIN_SERVICE="com.claudecode.bedrock-login-oidc"
+KEYCHAIN_ACCOUNT_REFRESH="cognito-refresh-token"
+KEYCHAIN_ACCOUNT_LOGOUT="cognito-logout-flag"
+
+# Keychain からリフレッシュトークンを削除し、ログアウトフラグを設定
+security delete-generic-password -a "$KEYCHAIN_ACCOUNT_REFRESH" -s "$KEYCHAIN_SERVICE" 2>/dev/null || true
+security add-generic-password -a "$KEYCHAIN_ACCOUNT_LOGOUT" -s "$KEYCHAIN_SERVICE" -w "true" -U 2>/dev/null || \
+  security add-generic-password -a "$KEYCHAIN_ACCOUNT_LOGOUT" -s "$KEYCHAIN_SERVICE" -w "true" 2>/dev/null
+
+echo "ログアウトしました。" >&2
+
+# --local オプションならここで終了
+if [ "${1:-}" = "--local" ]; then
+  exit 0
+fi
+
+# ブラウザの Cognito セッションもログアウト
+COGNITO_DOMAIN="${COGNITO_DOMAIN:-}"
+CLIENT_ID="${COGNITO_CLIENT_ID:-}"
+
+if [ -n "$COGNITO_DOMAIN" ] && [ -n "$CLIENT_ID" ]; then
+  # 空いているポートを探す
+  selected_port=""
+  for port in "${CALLBACK_PORTS[@]}"; do
+    if ! lsof -i ":$port" >/dev/null 2>&1; then
+      selected_port="$port"
+      break
+    fi
+  done
+
+  if [ -z "$selected_port" ]; then
+    echo "エラー: 全てのポート (${CALLBACK_PORTS[*]}) が使用中です" >&2
+    exit 1
+  fi
+
+  LOGOUT_REDIRECT="http://localhost:${selected_port}/logged-out"
+  LOGOUT_URL="${COGNITO_DOMAIN}/logout?client_id=${CLIENT_ID}&logout_uri=${LOGOUT_REDIRECT}"
+
+  echo "ブラウザでログアウト中..." >&2
+
+  # ローカルサーバを先に起動してからブラウザを開く
+  python3 -c "
+import http.server
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write('✅ ログアウト完了！このタブを閉じてください。'.encode('utf-8'))
+    def log_message(self, format, *args):
+        pass
+
+server = http.server.HTTPServer(('127.0.0.1', ${selected_port}), Handler)
+server.timeout = 30
+server.handle_request()
+" &
+  SERVER_PID=$!
+
+  sleep 0.3
+
+  open "$LOGOUT_URL" 2>/dev/null || xdg-open "$LOGOUT_URL" 2>/dev/null || {
+    echo "ブラウザを手動で開いてください: $LOGOUT_URL" >&2
+  }
+
+  wait "$SERVER_PID" 2>/dev/null || true
+  echo "完了。" >&2
+else
+  echo "env.sh が見つからないため、ブラウザのログアウトはスキップしました。" >&2
+fi

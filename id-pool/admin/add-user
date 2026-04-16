@@ -1,0 +1,52 @@
+#!/bin/bash
+# Cognito User Pool にユーザを追加し、仮パスワードをメールで送信する
+# Usage: ADMIN_AWS_PROFILE=your-profile ./add-user user@example.com
+set -euo pipefail
+export AWS_PAGER=""
+
+PROFILE="${ADMIN_AWS_PROFILE:?環境変数 ADMIN_AWS_PROFILE を設定してください（例: export ADMIN_AWS_PROFILE=genai-poc）}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/../env.sh"
+if [ -f "$ENV_FILE" ]; then
+  source "$ENV_FILE"
+fi
+
+USER_POOL_ID="${COGNITO_USER_POOL_ID:?env.sh が見つからないか COGNITO_USER_POOL_ID が未設定です}"
+
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <email>" >&2
+  exit 1
+fi
+
+EMAIL="$1"
+
+# ランダムな仮パスワードを生成（大文字・小文字・数字を含む12文字）
+TEMP_PASSWORD=$(python3 -c "
+import secrets, string
+alpha = string.ascii_letters + string.digits
+while True:
+    pw = ''.join(secrets.choice(alpha) for _ in range(12))
+    if any(c.isupper() for c in pw) and any(c.islower() for c in pw) and any(c.isdigit() for c in pw):
+        print(pw)
+        break
+")
+
+echo "ユーザを作成中: $EMAIL"
+
+aws --profile "$PROFILE" cognito-idp admin-create-user \
+  --user-pool-id "$USER_POOL_ID" \
+  --username "$EMAIL" \
+  --temporary-password "$TEMP_PASSWORD" \
+  --user-attributes Name=email,Value="$EMAIL" Name=email_verified,Value=true \
+  --desired-delivery-mediums EMAIL \
+  --no-cli-pager \
+  --output text --query "User.UserStatus"
+
+echo ""
+echo "=== ユーザ作成完了 ==="
+echo "  Email:    $EMAIL"
+echo "  仮パスワード: $TEMP_PASSWORD"
+echo "  状態:     FORCE_CHANGE_PASSWORD（初回ログイン時にパスワード変更が必要）"
+echo ""
+echo "※ Cognito から招待メールが送信されます（デフォルトのメール送信上限: 50通/日）"

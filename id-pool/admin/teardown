@@ -1,0 +1,76 @@
+#!/bin/bash
+# setup.sh で作成した全リソースを削除するスクリプト
+# Usage: ADMIN_AWS_PROFILE=your-profile ./teardown
+set -euo pipefail
+export AWS_PAGER=""
+
+PROFILE="${ADMIN_AWS_PROFILE:?環境変数 ADMIN_AWS_PROFILE を設定してください（例: export ADMIN_AWS_PROFILE=genai-poc）}"
+REGION="ap-northeast-1"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/../env.sh"
+if [ -f "$ENV_FILE" ]; then
+  source "$ENV_FILE"
+else
+  echo "env.sh が見つかりません。手動で削除してください。" >&2
+  exit 1
+fi
+
+ROLE_NAME="${IAM_ROLE_NAME:-BedrockClaudeCodeCognitoRole}"
+
+echo "=== Claude Code on Bedrock リソース削除 ==="
+echo ""
+echo "削除対象:"
+echo "  User Pool:        $COGNITO_USER_POOL_ID"
+echo "  Domain:           $COGNITO_DOMAIN_PREFIX"
+echo "  User Pool Client: $COGNITO_CLIENT_ID"
+echo "  Identity Pool:    $COGNITO_IDENTITY_POOL_ID"
+echo "  IAM Role:         $ROLE_NAME"
+echo ""
+read -rp "本当に削除しますか？ (yes/no): " CONFIRM
+if [ "$CONFIRM" != "yes" ]; then
+  echo "中止しました。"
+  exit 0
+fi
+
+echo "[1/5] IAM ロールを削除..."
+aws --profile "$PROFILE" iam delete-role-policy \
+  --role-name "$ROLE_NAME" \
+  --policy-name "BedrockAccess" \
+  --no-cli-pager 2>/dev/null || true
+aws --profile "$PROFILE" iam delete-role \
+  --role-name "$ROLE_NAME" \
+  --no-cli-pager 2>/dev/null || true
+echo "  -> 完了"
+
+echo "[2/5] Identity Pool を削除..."
+aws --profile "$PROFILE" cognito-identity delete-identity-pool \
+  --identity-pool-id "$COGNITO_IDENTITY_POOL_ID" \
+  --region "$REGION" \
+  --no-cli-pager 2>/dev/null || true
+echo "  -> 完了"
+
+echo "[3/5] User Pool Client を削除..."
+aws --profile "$PROFILE" cognito-idp delete-user-pool-client \
+  --user-pool-id "$COGNITO_USER_POOL_ID" \
+  --client-id "$COGNITO_CLIENT_ID" \
+  --no-cli-pager 2>/dev/null || true
+echo "  -> 完了"
+
+echo "[4/5] Cognito ドメインを削除..."
+aws --profile "$PROFILE" cognito-idp delete-user-pool-domain \
+  --user-pool-id "$COGNITO_USER_POOL_ID" \
+  --domain "$COGNITO_DOMAIN_PREFIX" \
+  --no-cli-pager 2>/dev/null || true
+echo "  -> 完了"
+
+echo "[5/5] User Pool を削除..."
+aws --profile "$PROFILE" cognito-idp delete-user-pool \
+  --user-pool-id "$COGNITO_USER_POOL_ID" \
+  --no-cli-pager 2>/dev/null || true
+echo "  -> 完了"
+
+rm -f "$ENV_FILE"
+rm -rf "${HOME}/.cache/bedrock-login"
+echo ""
+echo "=== 削除完了 ==="
