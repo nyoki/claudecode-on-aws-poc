@@ -1,6 +1,6 @@
-# Claude Code on AWS Bedrock — IAM OIDC Federation 方式
+# Claude Code on Amazon Bedrock — IAM OIDC Federation 方式
 
-Cognito ユーザ認証 + IAM OIDC Federation を経由して Claude Code を AWS Bedrock 上で利用するためのツール。STS `AssumeRoleWithWebIdentity` で一時クレデンシャルを取得する。
+Cognito ユーザ認証 + IAM OIDC Federation を経由して Claude Code を Amazon Bedrock 上で利用するためのツール。STS `AssumeRoleWithWebIdentity` で一時クレデンシャルを取得する。
 
 共通の利用方法（Claude Code の設定、ログイン/ログアウト、トラブルシューティング等）は [ルートの README](../README.md) を参照。
 

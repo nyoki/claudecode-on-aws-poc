@@ -1,6 +1,6 @@
-# Claude Code on AWS Bedrock — Cognito 認証 PoC
+# Claude Code on Amazon Bedrock — Cognito 認証 PoC
 
-Cognito ユーザ認証を経由して Claude Code を AWS Bedrock 上で利用するための PoC スクリプト集。
+Cognito ユーザ認証を経由して Claude Code を Amazon Bedrock 上で利用するための PoC スクリプト集。
 
 IAM ユーザを作らずに、Cognito のユーザ管理だけで Bedrock を利用できる。Claude Code の `awsCredentialExport` 機能を使い、`~/.aws/` に一切触れない構成。
 
